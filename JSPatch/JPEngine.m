@@ -34,6 +34,7 @@ JPBOXING_GEN(boxAssignObj, assignObj, id)
     if (self.obj) return self.obj;
     if (self.weakObj) return self.weakObj;
     if (self.assignObj) return self.assignObj;
+    if (self.cls) return self.cls;
     return self;
 }
 - (void *)unboxPointer
@@ -58,6 +59,10 @@ static NSMethodSignature *fixSignature(NSMethodSignature *signature)
 {
 #if TARGET_OS_IPHONE
 #ifdef __LP64__
+    if (!signature) {
+        return nil;
+    }
+    
     if ([[UIDevice currentDevice].systemVersion floatValue] < 7.1) {
         BOOL isReturnDouble = (strcmp([signature methodReturnType], "d") == 0);
         BOOL isReturnFloat = (strcmp([signature methodReturnType], "f") == 0);
@@ -138,6 +143,10 @@ static NSRecursiveLock     *_JSMethodForwardCallLock;
 static NSMutableDictionary *_protocolTypeEncodeDict;
 static NSMutableArray      *_pointersToRelease;
 
+#ifdef DEBUG
+static NSArray *_JSLastCallStack;
+#endif
+
 static void (^_exceptionBlock)(NSString *log) = ^void(NSString *log) {
     NSCAssert(NO, log);
 };
@@ -154,6 +163,17 @@ static void (^_exceptionBlock)(NSString *log) = ^void(NSString *log) {
     
     JSContext *context = [[JSContext alloc] init];
     
+#ifdef DEBUG
+    context[@"po"] = ^JSValue*(JSValue *obj) {
+        id ocObject = formatJSToOC(obj);
+        return [JSValue valueWithObject:[ocObject description] inContext:_context];
+    };
+
+    context[@"bt"] = ^JSValue*() {
+        return [JSValue valueWithObject:_JSLastCallStack inContext:_context];
+    };
+#endif
+
     context[@"_OC_defineClass"] = ^(NSString *classDeclaration, JSValue *instanceMethods, JSValue *classMethods) {
         return defineClass(classDeclaration, instanceMethods, classMethods);
     };
@@ -333,7 +353,7 @@ static void (^_exceptionBlock)(NSString *log) = ^void(NSString *log) {
     if (!_regex) {
         _regex = [NSRegularExpression regularExpressionWithPattern:_regexStr options:0 error:nil];
     }
-    NSString *formatedScript = [NSString stringWithFormat:@";(function(){try{%@}catch(e){_OC_catch(e.message, e.stack)}})();", [_regex stringByReplacingMatchesInString:script options:0 range:NSMakeRange(0, script.length) withTemplate:_replaceStr]];
+    NSString *formatedScript = [NSString stringWithFormat:@";(function(){try{\n%@\n}catch(e){_OC_catch(e.message, e.stack)}})();", [_regex stringByReplacingMatchesInString:script options:0 range:NSMakeRange(0, script.length) withTemplate:_replaceStr]];
     @try {
         if ([_context respondsToSelector:@selector(evaluateScript:withSourceURL:)]) {
             return [_context evaluateScript:formatedScript withSourceURL:resourceURL];
@@ -628,10 +648,11 @@ static JSValue *getJSFunctionInObjectHierachy(id slf, NSString *selectorName)
     return func;
 }
 
-#pragma clang diagnostic pop
-
 static void JPForwardInvocation(__unsafe_unretained id assignSlf, SEL selector, NSInvocation *invocation)
 {
+#ifdef DEBUG
+    _JSLastCallStack = [NSThread callStackSymbols];
+#endif
     BOOL deallocFlag = NO;
     id slf = assignSlf;
     NSMethodSignature *methodSignature = [invocation methodSignature];
@@ -817,8 +838,9 @@ static void JPForwardInvocation(__unsafe_unretained id assignSlf, SEL selector, 
             Class ret;   \
             id obj = formatJSToOC(jsval); \
             if ([obj isKindOfClass:[JPBoxing class]]) { \
-                ret = [((JPBoxing *)obj) unboxClass]; \
+               ret = [((JPBoxing *)obj) unboxClass]; \
             }
+
 
         #define JP_FWD_RET_CODE_SEL    \
             SEL ret;   \
@@ -999,7 +1021,12 @@ static id callSelector(NSString *className, NSString *selectorName, JSValue *arg
    
     if (instance) {
         instance = formatJSToOC(instance);
-        if (!instance || instance == _nilObj || [instance isKindOfClass:[JPBoxing class]]) return @{@"__isNil": @(YES)};
+        if (class_isMetaClass(object_getClass(instance))) {
+            className = NSStringFromClass((Class)instance);
+            instance = nil;
+        } else if (!instance || instance == _nilObj || [instance isKindOfClass:[JPBoxing class]]) {
+            return @{@"__isNil": @(YES)};
+        }
     }
     id argumentsObj = formatJSToOC(arguments);
     
@@ -1398,7 +1425,7 @@ static id genCallbackBlock(JSValue *jsVal)
     #define BLK_TRAITS_ARG(_idx, _paramName) \
     if (_idx < argTypes.count) { \
         NSString *argType = trim(argTypes[_idx]); \
-        if (blockTypeIsSCalarPointer(argType)) { \
+        if (blockTypeIsScalarPointer(argType)) { \
             [list addObject:formatOCToJS([JPBoxing boxPointer:_paramName])]; \
         } else if (blockTypeIsObject(trim(argTypes[_idx]))) {  \
             [list addObject:formatOCToJS((__bridge id)_paramName)]; \
@@ -1600,7 +1627,7 @@ static BOOL blockTypeIsObject(NSString *typeString)
     return [typeString rangeOfString:@"*"].location != NSNotFound || [typeString isEqualToString:@"id"];
 }
 
-static BOOL blockTypeIsSCalarPointer(NSString *typeString)
+static BOOL blockTypeIsScalarPointer(NSString *typeString)
 {
     NSUInteger location = [typeString rangeOfString:@"*"].location;
     NSString *typeWithoutAsterisk = trim([typeString stringByReplacingOccurrencesOfString:@"*" withString:@""]);
